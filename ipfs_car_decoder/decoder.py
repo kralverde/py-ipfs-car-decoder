@@ -1,37 +1,49 @@
+import os
+
+import aiofiles
 import attr
 import dag_cbor
 
-from typing import Dict, Sequence, Mapping
+from typing import List, Dict, Sequence, Mapping, Optional, Union, AsyncIterator
 
 from multiformats import CID
 
-from ipfs_car_decoder.async_stream import AsyncByteStream
+from ipfs_car_decoder.async_stream import CARByteStream
+
+from unix_fs_exporter import export, recursive_export, BlockStore, UnixFSFile, UnixFSDirectory, RawNode, IdentityNode
 
 _V2_HEADER_LENGTH = 40
 _CIDV0_SHA2_256 = 0x12
 _CIDV0_LENGTH = 0x20
 
+_CID = Union[CID, str, bytes]
+
+
 class CarDecodeException(Exception): pass
 
+
 @attr.define(slots=True, frozen=True)
-class BlockIndex:
+class CARStreamBlockIndex:
     cid: CID
     length: int
     block_length: int
     offset: int
     block_offset: int
 
-class BlockIndexer:
-    # CID -> Index
-    mapping: Dict[bytes, BlockIndex]
-    stream: AsyncByteStream
 
-    def __init__(self, stream: AsyncByteStream):
+class CARStreamBlockIndexer:
+    # CID -> Index
+    mapping: Dict[bytes, CARStreamBlockIndex]
+    header: Optional[Mapping[str, dag_cbor.IPLDKind]]
+    stream: CARByteStream
+
+    def __init__(self, stream: CARByteStream):
         self.mapping = dict()
         self.stream = stream
+        self.header = None
 
     @classmethod
-    async def from_byte_stream(cls, stream: AsyncByteStream) -> 'BlockIndexer':
+    async def from_stream(cls, stream: CARByteStream) -> 'CARStreamBlockIndexer':
         indexer = cls(stream)
 
         header_length = await stream.read_var_int()
@@ -67,6 +79,8 @@ class BlockIndexer:
                 raise CarDecodeException('the v1 header length must be positive')
             v1_header_raw = await stream.read_bytes(v1_header_length)
             header = dag_cbor.decode(v1_header_raw)
+            if not isinstance(header, Mapping):
+                raise CarDecodeException('the header must be a map')
             if header['version'] != 1:
                 raise CarDecodeException('v1 header must be with the v2 header')
             if not isinstance(header['roots'], Sequence):
@@ -74,12 +88,14 @@ class BlockIndexer:
             header.update(v2_header)
             stream._limit = header['data_size'] + header['data_offset']
 
-        while stream.can_read_more():
-            offset = stream._pos
+        indexer.header = header
+
+        while await stream.can_read_more():
+            offset = stream.pos
             length = await stream.read_var_int()
             if length <= 0:
                 raise CarDecodeException('block length must be positive')
-            length += (stream._pos - offset)
+            length += (stream.pos - offset)
             first = await stream.read_bytes(2, walk_forward=False)
             if first[0] == _CIDV0_SHA2_256 and first[1] == _CIDV0_LENGTH:
                 raw_multihash = await stream.read_bytes(34)
@@ -93,35 +109,111 @@ class BlockIndexer:
                 raw_hash = await stream.read_bytes(multihash_length)
                 assert len(raw_hash) == multihash_length
                 cid = CID('base32', version, codec, (multihash_code, raw_hash))
-            block_length = length - (stream._pos - offset)
-            index = BlockIndex(cid, length, block_length, offset, stream._pos)
-            stream.move(stream._pos + block_length)
-            indexer.mapping[bytes(cid)] = index
+            block_length = length - (stream.pos - offset)
+            index = CARStreamBlockIndex(cid, length, block_length, offset, stream.pos)
+            stream.move(stream.pos + block_length)
+            indexer.mapping[cid.digest] = index
         return indexer
 
-if __name__ == '__main__':
-    import aiohttp
-    import asyncio
 
-    from ipfs_car_decoder.async_stream import ChunkedMemoryAsyncByteStream
+class IndexedBlockstore(BlockStore):
+    def __init__(self, stream: CARByteStream, indexer: CARStreamBlockIndexer, validate=True):
+        self.stream = stream
+        self.indexer = indexer
+        self.validate = validate
+        self.checked = set()
 
-    ipfs_hash = 'bafybeih47mtobjeh3kclj2xfk3z5fyc5pnpgz3bht6h3ixqhayjksyojqu'
-    stream = ChunkedMemoryAsyncByteStream()
+    @classmethod
+    async def from_stream(cls, stream: CARByteStream) -> 'IndexedBlockstore':
+        indexer = await CARStreamBlockIndexer.from_stream(stream)
+        return cls(stream, indexer)
 
-    async def test():
-        task = asyncio.create_task(BlockIndexer.from_byte_stream(stream))
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f'https://ipfs.io/ipfs/{ipfs_hash}', headers={'Accept': 'application/vnd.ipld.car'}) as resp:
-                async for chunk, _ in resp.content.iter_chunks():
-                    await stream.append_bytes(chunk)
-        indexer = await task
-        for cid_raw, index in indexer.mapping.items():
-            cid = CID.decode(cid_raw)
-            stream.move(index.block_offset)
-            raw = await stream.read_bytes(index.block_length)
-            assert cid == index.cid
+    async def get_block(self, cid: CID) -> bytes:
+        digest = cid.digest
+        try:
+            index = self.indexer.mapping[digest]
+        except KeyError:
+            raise CarDecodeException(f'no index for {repr("base32")}')
+        self.stream.move(index.block_offset)
+        raw = await self.stream.read_bytes(index.block_length)
+        if self.validate and digest not in self.checked:
+            if cid != index.cid:
+                raise CarDecodeException('cid does not match index')
             hash_fun, _ = cid.hashfun.implementation
             hashed = hash_fun(raw)
-            assert hashed == cid.raw_digest
+            if hashed != cid.raw_digest:
+                raise CarDecodeException('cid does not match digest')
+            self.checked.add(digest)
+        return raw
+
+
+async def stream_bytes(cid: _CID, stream: CARByteStream) -> AsyncIterator[bytes]:
+    if isinstance(cid, (bytes, str)):
+        cid = CID.decode(cid)
+    if not isinstance(cid, CID):
+        raise CarDecodeException('cid must be CID decodable')
+
+    block_store = await IndexedBlockstore.from_stream(stream)
+
+    result = await export(cid, block_store)
+    if not isinstance(result, (UnixFSFile, RawNode, IdentityNode)):
+        raise CarDecodeException(f'car stream for {cid} not convertable to bytes')
+
+    async for chunk in result.content:
+        yield chunk
+
+
+async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_directory: str, name='') -> None:
+    if isinstance(cid, (bytes, str)):
+        cid = CID.decode(cid)
+    if not isinstance(cid, CID):
+        raise CarDecodeException('cid must be CID decodable')
+
+    block_store = await IndexedBlockstore.from_stream(stream)
+
+    async for entry in recursive_export(cid, block_store):
+        local_path = entry.path
+        if name:
+            path_parts: List[str] = []
+            head = local_path
+            while True:
+                head, tail = os.path.split(head)
+                path_parts.append(tail)
+                if not head:
+                    break
+            if CID.decode(path_parts[-1]).digest == cid.digest:
+                path_parts[-1] = name
+            local_path = os.path.join(*path_parts[::-1])
+        path = os.path.join(parent_directory, local_path)
+        if isinstance(entry, (UnixFSFile, RawNode, IdentityNode)):
+            async with aiofiles.open(path, 'wb') as f:
+                async for chunk in entry.content:
+                    await f.write(chunk)
+        elif isinstance(entry, UnixFSDirectory):
+            os.makedirs(path, exist_ok=True)
+        else:
+            raise CarDecodeException(f'car stream for {cid} is not convertable to a file system')
+
+if __name__ == '__main__':
+    import asyncio
+    import aiohttp
+
+    from ipfs_car_decoder import ChunkedMemoryByteStream, stream_bytes
+
+    ipfs_hash = 'bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq'
+
+    async def test():
+        stream = ChunkedMemoryByteStream()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'https://ipfs.io/ipfs/{ipfs_hash}', headers={'Accept':'application/vnd.ipld.car'}) as resp:
+                resp.raise_for_status()
+                assert resp.content_type == 'application/vnd.ipld.car'
+                async for chunk, _ in resp.content.iter_chunks():
+                    await stream.append_bytes(chunk)
+        await stream.mark_complete()
+        acc = b''
+        async for chunk in stream_bytes(ipfs_hash, stream):
+            acc += chunk
+        print(acc)
 
     asyncio.run(test())

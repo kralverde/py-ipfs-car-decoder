@@ -1,3 +1,6 @@
 *dist
 *build
 *.egg-info
+*__pycache__
+ipfs_test*
+*pytest_cache
