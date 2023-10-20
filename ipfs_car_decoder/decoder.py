@@ -187,7 +187,7 @@ async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_
                     break
             if CID.decode(path_parts[-1]).digest == cid.digest:
                 path_parts[-1] = name
-            local_path = os.path.join(*path_parts[::-1])
+            local_path = os.path.join(*reversed(path_parts))
         path = os.path.join(parent_directory, local_path)
         if isinstance(entry, (UnixFSFile, RawNode, IdentityNode)):
             async with aiofiles.open(path, 'wb') as f:
