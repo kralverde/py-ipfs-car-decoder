@@ -4,3 +4,4 @@
 *__pycache__
 ipfs_test*
 *pytest_cache
+*mypy_cache

@@ -4,7 +4,7 @@ import aiofiles
 import attr
 import dag_cbor
 
-from typing import List, Dict, Sequence, Mapping, Optional, Union, AsyncIterator
+from typing import Set, List, Dict, Sequence, Mapping, MutableMapping, Optional, Union, AsyncIterator, Callable
 
 from multiformats import CID
 
@@ -62,8 +62,8 @@ class CARStreamBlockIndexer:
             if 'roots' in header:
                 raise CarDecodeException('roots cannot be in a v2 header')
             v2_header_raw = await stream.read_bytes(_V2_HEADER_LENGTH)
-            btole64 = lambda b: int.from_bytes(b, 'little')
-            v2_header = {
+            btole64: Callable[[bytes], int] = lambda b: int.from_bytes(b, 'little')
+            v2_header: Mapping[str, dag_cbor.IPLDKind] = {
                 'version': 2,
                 'characteristics': [
                     btole64(v2_header_raw[:8]),
@@ -73,20 +73,24 @@ class CARStreamBlockIndexer:
                 'data_size': btole64(v2_header_raw[24:32]),
                 'index_offset': btole64(v2_header_raw[32:40])
             }
-            stream.move(v2_header['data_offset'])
+            data_offset = v2_header['data_offset']
+            assert isinstance(data_offset, int)
+            stream.move(data_offset)
             v1_header_length = await stream.read_var_int()
             if v1_header_length <= 0:
                 raise CarDecodeException('the v1 header length must be positive')
             v1_header_raw = await stream.read_bytes(v1_header_length)
             header = dag_cbor.decode(v1_header_raw)
-            if not isinstance(header, Mapping):
+            if not isinstance(header, MutableMapping):
                 raise CarDecodeException('the header must be a map')
             if header['version'] != 1:
                 raise CarDecodeException('v1 header must be with the v2 header')
             if not isinstance(header['roots'], Sequence):
                 raise CarDecodeException('roots must be a sequence')
             header.update(v2_header)
-            stream._limit = header['data_size'] + header['data_offset']
+            data_size = header['data_size']
+            assert isinstance(data_size, int)
+            stream._limit = data_size + data_offset
 
         indexer.header = header
 
@@ -117,11 +121,11 @@ class CARStreamBlockIndexer:
 
 
 class IndexedBlockstore(BlockStore):
-    def __init__(self, stream: CARByteStream, indexer: CARStreamBlockIndexer, validate=True):
+    def __init__(self, stream: CARByteStream, indexer: CARStreamBlockIndexer, validate: bool=True) -> None:
         self.stream = stream
         self.indexer = indexer
         self.validate = validate
-        self.checked = set()
+        self.checked: Set[bytes] = set()
 
     @classmethod
     async def from_stream(cls, stream: CARByteStream) -> 'IndexedBlockstore':
@@ -163,7 +167,7 @@ async def stream_bytes(cid: _CID, stream: CARByteStream) -> AsyncIterator[bytes]
         yield chunk
 
 
-async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_directory: str, name='') -> None:
+async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_directory: str, name: str='') -> None:
     if isinstance(cid, (bytes, str)):
         cid = CID.decode(cid)
     if not isinstance(cid, CID):
@@ -193,27 +197,3 @@ async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_
             os.makedirs(path, exist_ok=True)
         else:
             raise CarDecodeException(f'car stream for {cid} is not convertable to a file system')
-
-if __name__ == '__main__':
-    import asyncio
-    import aiohttp
-
-    from ipfs_car_decoder import ChunkedMemoryByteStream, stream_bytes
-
-    ipfs_hash = 'bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq'
-
-    async def test():
-        stream = ChunkedMemoryByteStream()
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f'https://ipfs.io/ipfs/{ipfs_hash}', headers={'Accept':'application/vnd.ipld.car'}) as resp:
-                resp.raise_for_status()
-                assert resp.content_type == 'application/vnd.ipld.car'
-                async for chunk, _ in resp.content.iter_chunks():
-                    await stream.append_bytes(chunk)
-        await stream.mark_complete()
-        acc = b''
-        async for chunk in stream_bytes(ipfs_hash, stream):
-            acc += chunk
-        print(acc)
-
-    asyncio.run(test())

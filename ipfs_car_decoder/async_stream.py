@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Awaitable
 
 import os
 
@@ -17,7 +17,7 @@ class CARByteStreamException(Exception):
     pass
 
 class CARByteStream(ABC):
-    def __init__(self):
+    def __init__(self) -> None:
         self._pos = 0
         self._limit: Optional[int] = None
 
@@ -39,7 +39,7 @@ class CARByteStream(ABC):
     def move(self, position: int) -> None:
         self._pos = position
 
-    async def read_bytes(self, count: int, walk_forward=True) -> bytes:
+    async def read_bytes(self, count: int, walk_forward: bool=True) -> bytes:
         result = await self.read_slice(self._pos, count + self._pos)
         assert len(result) == count, f'expected {count} bytes, got {len(result)}'
         if walk_forward:
@@ -63,7 +63,7 @@ class CARByteStream(ABC):
         return result 
 
 class ChunkedMemoryByteStream(CARByteStream):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self._complete = False
         self._bytes = bytearray()
@@ -100,7 +100,9 @@ class ChunkedMemoryByteStream(CARByteStream):
         return self._pos < (self._limit or (len(self._bytes) - 1))
     
 class FileByteStream(CARByteStream):
-    def __init__(self, file: 'FileDescriptorOrPath', *, close_fd=True):
+    _fd: Optional[int]
+
+    def __init__(self, file: 'FileDescriptorOrPath', *, close_fd: bool=True) -> None:
         super().__init__()
         if isinstance(file, int):
             self._fd = file
@@ -110,18 +112,22 @@ class FileByteStream(CARByteStream):
         self._close_fd = close_fd
         
     def close(self) -> None:
+        if self._fd is None:
+            raise CARByteStreamException('this stream was already closed')
         if self._close_fd:
             os.close(self._fd)
         self._fd = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> 'FileByteStream':
         return self
     
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *args):  # type: ignore
         self.close()
 
     async def can_read_more(self) -> bool:
         if self._size is None:
+            if self._fd is None:
+                raise CARByteStreamException('this stream was already closed')    
             self._size = await aiofiles.os.path.getsize(self._fd)
         return self._pos < (self._limit or (self._size - 1))
     
