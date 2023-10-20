@@ -1,7 +1,9 @@
 Validate what an IPFS gateway returns by decoding and validating the CAR block.
 
-Example
+Usage
 -----
+
+CARs can be read from memory or file and can be exported as a file/folder or byte stream
 
 >>> import asyncio
 >>> import aiohttp
@@ -26,3 +28,4 @@ Example
 ...
 >>> asyncio.run(test())
 b'hello'
+
