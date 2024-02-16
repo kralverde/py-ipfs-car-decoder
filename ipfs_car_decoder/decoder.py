@@ -4,13 +4,32 @@ import aiofiles
 import attr
 import dag_cbor
 
-from typing import Set, List, Dict, Sequence, Mapping, MutableMapping, Optional, Union, AsyncIterator, Callable
+from typing import (
+    Set,
+    List,
+    Dict,
+    Sequence,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Union,
+    AsyncIterator,
+    Callable,
+)
 
 from multiformats import CID
 
 from ipfs_car_decoder.async_stream import CARByteStream
 
-from unix_fs_exporter import export, recursive_export, BlockStore, UnixFSFile, UnixFSDirectory, RawNode, IdentityNode
+from unix_fs_exporter import (
+    export,
+    recursive_export,
+    BlockStore,
+    UnixFSFile,
+    UnixFSDirectory,
+    RawNode,
+    IdentityNode,
+)
 
 _V2_HEADER_LENGTH = 40
 _CIDV0_SHA2_256 = 0x12
@@ -19,7 +38,8 @@ _CIDV0_LENGTH = 0x20
 _CID = Union[CID, str, bytes]
 
 
-class CarDecodeException(Exception): pass
+class CarDecodeException(Exception):
+    pass
 
 
 @attr.define(slots=True, frozen=True)
@@ -43,52 +63,52 @@ class CARStreamBlockIndexer:
         self.header = None
 
     @classmethod
-    async def from_stream(cls, stream: CARByteStream) -> 'CARStreamBlockIndexer':
+    async def from_stream(cls, stream: CARByteStream) -> "CARStreamBlockIndexer":
         indexer = cls(stream)
 
         header_length = await stream.read_var_int()
         if header_length <= 0:
-            raise CarDecodeException('header length must be positive')
+            raise CarDecodeException("header length must be positive")
         raw_header = await stream.read_bytes(header_length)
         header = dag_cbor.decode(raw_header)
         if not isinstance(header, Mapping):
-            raise CarDecodeException('the header must be a map')
-        if header['version'] not in (1, 2):
+            raise CarDecodeException("the header must be a map")
+        if header["version"] not in (1, 2):
             raise CarDecodeException(f'unknown car version {header["version"]}')
-        if header['version'] == 1:
-            if not isinstance(header['roots'], Sequence):
-                raise CarDecodeException('roots must be a sequence')
+        if header["version"] == 1:
+            if not isinstance(header["roots"], Sequence):
+                raise CarDecodeException("roots must be a sequence")
         else:
-            if 'roots' in header:
-                raise CarDecodeException('roots cannot be in a v2 header')
+            if "roots" in header:
+                raise CarDecodeException("roots cannot be in a v2 header")
             v2_header_raw = await stream.read_bytes(_V2_HEADER_LENGTH)
-            btole64: Callable[[bytes], int] = lambda b: int.from_bytes(b, 'little')
+            btole64: Callable[[bytes], int] = lambda b: int.from_bytes(b, "little")
             v2_header: Mapping[str, dag_cbor.IPLDKind] = {
-                'version': 2,
-                'characteristics': [
+                "version": 2,
+                "characteristics": [
                     btole64(v2_header_raw[:8]),
-                    btole64(v2_header_raw[8:16])
+                    btole64(v2_header_raw[8:16]),
                 ],
-                'data_offset': btole64(v2_header_raw[16:24]),
-                'data_size': btole64(v2_header_raw[24:32]),
-                'index_offset': btole64(v2_header_raw[32:40])
+                "data_offset": btole64(v2_header_raw[16:24]),
+                "data_size": btole64(v2_header_raw[24:32]),
+                "index_offset": btole64(v2_header_raw[32:40]),
             }
-            data_offset = v2_header['data_offset']
+            data_offset = v2_header["data_offset"]
             assert isinstance(data_offset, int)
             stream.move(data_offset)
             v1_header_length = await stream.read_var_int()
             if v1_header_length <= 0:
-                raise CarDecodeException('the v1 header length must be positive')
+                raise CarDecodeException("the v1 header length must be positive")
             v1_header_raw = await stream.read_bytes(v1_header_length)
             header = dag_cbor.decode(v1_header_raw)
             if not isinstance(header, MutableMapping):
-                raise CarDecodeException('the header must be a map')
-            if header['version'] != 1:
-                raise CarDecodeException('v1 header must be with the v2 header')
-            if not isinstance(header['roots'], Sequence):
-                raise CarDecodeException('roots must be a sequence')
+                raise CarDecodeException("the header must be a map")
+            if header["version"] != 1:
+                raise CarDecodeException("v1 header must be with the v2 header")
+            if not isinstance(header["roots"], Sequence):
+                raise CarDecodeException("roots must be a sequence")
             header.update(v2_header)
-            data_size = header['data_size']
+            data_size = header["data_size"]
             assert isinstance(data_size, int)
             stream._limit = data_size + data_offset
 
@@ -98,8 +118,8 @@ class CARStreamBlockIndexer:
             offset = stream.pos
             length = await stream.read_var_int()
             if length <= 0:
-                raise CarDecodeException('block length must be positive')
-            length += (stream.pos - offset)
+                raise CarDecodeException("block length must be positive")
+            length += stream.pos - offset
             first = await stream.read_bytes(2, walk_forward=False)
             if first[0] == _CIDV0_SHA2_256 and first[1] == _CIDV0_LENGTH:
                 raw_multihash = await stream.read_bytes(34)
@@ -112,7 +132,7 @@ class CARStreamBlockIndexer:
                 multihash_length = await stream.read_var_int()
                 raw_hash = await stream.read_bytes(multihash_length)
                 assert len(raw_hash) == multihash_length
-                cid = CID('base32', version, codec, (multihash_code, raw_hash))
+                cid = CID("base32", version, codec, (multihash_code, raw_hash))
             block_length = length - (stream.pos - offset)
             index = CARStreamBlockIndex(cid, length, block_length, offset, stream.pos)
             stream.move(stream.pos + block_length)
@@ -121,14 +141,19 @@ class CARStreamBlockIndexer:
 
 
 class IndexedBlockstore(BlockStore):
-    def __init__(self, stream: CARByteStream, indexer: CARStreamBlockIndexer, validate: bool=True) -> None:
+    def __init__(
+        self,
+        stream: CARByteStream,
+        indexer: CARStreamBlockIndexer,
+        validate: bool = True,
+    ) -> None:
         self.stream = stream
         self.indexer = indexer
         self.validate = validate
         self.checked: Set[bytes] = set()
 
     @classmethod
-    async def from_stream(cls, stream: CARByteStream) -> 'IndexedBlockstore':
+    async def from_stream(cls, stream: CARByteStream) -> "IndexedBlockstore":
         indexer = await CARStreamBlockIndexer.from_stream(stream)
         return cls(stream, indexer)
 
@@ -142,11 +167,13 @@ class IndexedBlockstore(BlockStore):
         raw = await self.stream.read_bytes(index.block_length)
         if self.validate and digest not in self.checked:
             if cid != index.cid:
-                raise CarDecodeException('cid does not match index')
+                raise CarDecodeException(
+                    f"cid does not match index ({cid} vs {index.cid})"
+                )
             hash_fun, _ = cid.hashfun.implementation
             hashed = hash_fun(raw)
             if hashed != cid.raw_digest:
-                raise CarDecodeException('cid does not match digest')
+                raise CarDecodeException("cid does not match digest")
             self.checked.add(digest)
         return raw
 
@@ -155,23 +182,25 @@ async def stream_bytes(cid: _CID, stream: CARByteStream) -> AsyncIterator[bytes]
     if isinstance(cid, (bytes, str)):
         cid = CID.decode(cid)
     if not isinstance(cid, CID):
-        raise CarDecodeException('cid must be CID decodable')
+        raise CarDecodeException("cid must be CID decodable")
 
     block_store = await IndexedBlockstore.from_stream(stream)
 
     result = await export(cid, block_store)
     if not isinstance(result, (UnixFSFile, RawNode, IdentityNode)):
-        raise CarDecodeException(f'car stream for {cid} not convertable to bytes')
+        raise CarDecodeException(f"car stream for {cid} not convertable to bytes")
 
     async for chunk in result.content:
         yield chunk
 
 
-async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_directory: str, name: str='') -> None:
+async def write_car_filesystem_to_path(
+    cid: _CID, stream: CARByteStream, parent_directory: str, name: str = ""
+) -> None:
     if isinstance(cid, (bytes, str)):
         cid = CID.decode(cid)
     if not isinstance(cid, CID):
-        raise CarDecodeException('cid must be CID decodable')
+        raise CarDecodeException("cid must be CID decodable")
 
     block_store = await IndexedBlockstore.from_stream(stream)
 
@@ -190,10 +219,12 @@ async def write_car_filesystem_to_path(cid: _CID, stream: CARByteStream, parent_
             local_path = os.path.join(*reversed(path_parts))
         path = os.path.join(parent_directory, local_path)
         if isinstance(entry, (UnixFSFile, RawNode, IdentityNode)):
-            async with aiofiles.open(path, 'wb') as f:
+            async with aiofiles.open(path, "wb") as f:
                 async for chunk in entry.content:
                     await f.write(chunk)
         elif isinstance(entry, UnixFSDirectory):
             os.makedirs(path, exist_ok=True)
         else:
-            raise CarDecodeException(f'car stream for {cid} is not convertable to a file system')
+            raise CarDecodeException(
+                f"car stream for {cid} is not convertable to a file system"
+            )
